@@ -11,8 +11,6 @@ import {PluginDefinition} from './plugin';
 import BaseDevice, {OS} from './devices/BaseDevice';
 import {Logger} from './fb-interfaces/Logger';
 import {Store} from './reducers/index';
-import {Payload, ConnectionStatus} from 'rsocket-types';
-import {Flowable, Single} from 'rsocket-flowable';
 import {performance} from 'perf_hooks';
 import {reportPluginFailures} from './utils/metrics';
 import {default as isProduction} from './utils/isProduction';
@@ -26,11 +24,7 @@ import {processMessagesLater} from './utils/messageQueue';
 import {emitBytesReceived} from './dispatcher/tracking';
 import {debounce} from 'lodash';
 import {batch} from 'react-redux';
-import {
-  createState,
-  _SandyPluginInstance,
-  _getFlipperLibImplementation,
-} from 'flipper-plugin';
+import {createState, _SandyPluginInstance, getFlipperLib} from 'flipper-plugin';
 import {freeze} from 'immer';
 import GK from './fb-stubs/GK';
 import {message} from 'antd';
@@ -38,6 +32,11 @@ import {
   isFlipperMessageDebuggingEnabled,
   registerFlipperDebugMessage,
 } from './chrome/FlipperMessages';
+import {
+  ConnectionStatus,
+  ErrorType,
+  ClientConnection,
+} from './comms/ClientConnection';
 
 type Plugins = Set<string>;
 type PluginsArr = Array<string>;
@@ -55,7 +54,6 @@ export type ClientExport = {
   query: ClientQuery;
 };
 
-type ErrorType = {message: string; stacktrace: string; name: string};
 type Params = {
   api: string;
   method: string;
@@ -89,13 +87,6 @@ const handleError = (store: Store, device: BaseDevice, error: ErrorType) => {
   crashReporterPlugin.instanceApi.reportCrash(payload);
 };
 
-export interface FlipperClientConnection<D, M> {
-  connectionStatus(): Flowable<ConnectionStatus>;
-  close(): void;
-  fireAndForget(payload: Payload<D, M>): void;
-  requestResponse(payload: Payload<D, M>): Single<Payload<D, M>>;
-}
-
 export default class Client extends EventEmitter {
   connected = createState(false);
   id: string;
@@ -104,7 +95,7 @@ export default class Client extends EventEmitter {
   messageIdCounter: number;
   plugins: Plugins;
   backgroundPlugins: Plugins;
-  connection: FlipperClientConnection<any, any> | null | undefined;
+  connection: ClientConnection | null | undefined;
   store: Store;
   activePlugins: Set<string>;
   freezeData = GK.get('flipper_frozen_data');
@@ -139,7 +130,7 @@ export default class Client extends EventEmitter {
   constructor(
     id: string,
     query: ClientQuery,
-    conn: FlipperClientConnection<any, any> | null | undefined,
+    conn: ClientConnection | null | undefined,
     logger: Logger,
     store: Store,
     plugins: Plugins | null | undefined,
@@ -165,18 +156,13 @@ export default class Client extends EventEmitter {
 
     const client = this;
     if (conn) {
-      conn.connectionStatus().subscribe({
-        onNext(payload) {
-          if (payload.kind == 'ERROR' || payload.kind == 'CLOSED') {
-            client.connected.set(false);
-          }
-        },
-        onSubscribe(subscription) {
-          subscription.request(Number.MAX_SAFE_INTEGER);
-        },
-        onError(payload) {
-          console.error('[client] connection status error ', payload);
-        },
+      conn.subscribeToEvents((status) => {
+        if (
+          status === ConnectionStatus.CLOSED ||
+          status === ConnectionStatus.ERROR
+        ) {
+          client.connected.set(false);
+        }
       });
     }
   }
@@ -224,7 +210,7 @@ export default class Client extends EventEmitter {
         this.sandyPluginStates.set(
           plugin.id,
           new _SandyPluginInstance(
-            _getFlipperLibImplementation(),
+            getFlipperLib(),
             plugin,
             this,
             getPluginKey(this.id, {serial: this.query.device_id}, plugin.id),
@@ -260,7 +246,7 @@ export default class Client extends EventEmitter {
       this.sandyPluginStates.set(
         plugin.id,
         new _SandyPluginInstance(
-          _getFlipperLibImplementation(),
+          getFlipperLib(),
           plugin,
           this,
           getPluginKey(this.id, {serial: this.query.device_id}, plugin.id),
@@ -535,7 +521,7 @@ export default class Client extends EventEmitter {
   }
 
   rawCall<T>(method: string, fromPlugin: boolean, params?: Params): Promise<T> {
-    return new Promise((resolve, reject) => {
+    return new Promise(async (resolve, reject) => {
       const id = this.messageIdCounter++;
       const metadata: RequestMetadata = {
         method,
@@ -560,7 +546,7 @@ export default class Client extends EventEmitter {
       if (this.sdkVersion < 1) {
         this.startTimingRequestResponse({method, id, params});
         if (this.connection) {
-          this.connection.fireAndForget({data: JSON.stringify(data)});
+          this.connection.send(data);
         }
         return;
       }
@@ -577,41 +563,33 @@ export default class Client extends EventEmitter {
         return;
       }
       if (!fromPlugin || this.isAcceptingMessagesFromPlugin(plugin)) {
-        this.connection!.requestResponse({
-          data: JSON.stringify(data),
-        }).subscribe({
-          onComplete: (payload) => {
-            if (!fromPlugin || this.isAcceptingMessagesFromPlugin(plugin)) {
-              const logEventName = this.getLogEventName(data);
-              this.logger.trackTimeSince(mark, logEventName);
-              emitBytesReceived(plugin || 'unknown', payload.data.length * 2);
-              const response: {
-                success?: Object;
-                error?: ErrorType;
-              } = JSON.parse(payload.data);
+        try {
+          const response = await this.connection!.sendExpectResponse(data);
+          if (!fromPlugin || this.isAcceptingMessagesFromPlugin(plugin)) {
+            const logEventName = this.getLogEventName(data);
+            this.logger.trackTimeSince(mark, logEventName);
+            emitBytesReceived(plugin || 'unknown', response.length * 2);
 
-              this.onResponse(response, resolve, reject);
+            this.onResponse(response, resolve, reject);
 
-              if (isFlipperMessageDebuggingEnabled()) {
-                registerFlipperDebugMessage({
-                  device: this.deviceSync?.displayTitle(),
-                  app: this.query.app,
-                  flipperInternalMethod: method,
-                  payload: response,
-                  plugin,
-                  pluginMethod: params?.method,
-                  direction: 'toFlipper:response',
-                });
-              }
+            if (isFlipperMessageDebuggingEnabled()) {
+              registerFlipperDebugMessage({
+                device: this.deviceSync?.displayTitle(),
+                app: this.query.app,
+                flipperInternalMethod: method,
+                payload: response,
+                plugin,
+                pluginMethod: params?.method,
+                direction: 'toFlipper:response',
+              });
             }
-          },
-          onError: (e) => {
-            // This is only called if the connection is dead. Not in expected
-            // and recoverable cases like a missing receiver/method.
-            this.disconnect();
-            reject(new Error('Connection disconnected: ' + e));
-          },
-        });
+          }
+        } catch (error) {
+          // This is only called if the connection is dead. Not in expected
+          // and recoverable cases like a missing receiver/method.
+          this.disconnect();
+          reject(new Error('Unable to send, connection error: ' + error));
+        }
       } else {
         reject(
           new Error(
@@ -703,7 +681,7 @@ export default class Client extends EventEmitter {
     };
     console.debug(data, 'message:send');
     if (this.connection) {
-      this.connection.fireAndForget({data: JSON.stringify(data)});
+      this.connection.send(data);
     }
 
     if (isFlipperMessageDebuggingEnabled()) {

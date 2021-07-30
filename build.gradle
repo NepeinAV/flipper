@@ -12,9 +12,9 @@ buildscript {
     }
     dependencies {
         classpath 'com.android.tools.build:gradle:4.2.1'
-        classpath 'com.vanniktech:gradle-maven-publish-plugin:0.16.0'
+        classpath 'com.vanniktech:gradle-maven-publish-plugin:0.17.0'
         classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$KOTLIN_VERSION"
-        classpath "org.jetbrains.dokka:dokka-gradle-plugin:1.4.32"
+        classpath "org.jetbrains.dokka:dokka-gradle-plugin:1.5.0"
     }
 }
 
@@ -24,7 +24,7 @@ plugins {
 }
 
 ext.isSnapshot = { VERSION_NAME.endsWith('-SNAPSHOT') }
-ext.isRelease = { ['uploadArchives', 'bintrayUpload'].any { gradle.startParameter.taskNames.contains(it) } }
+ext.isRelease = { ['publish', 'publishToMavenLocal'].any { gradle.startParameter.taskNames.contains(it) } }
 
 subprojects {
     repositories {
@@ -46,12 +46,10 @@ subprojects {
 
 ext {
     minSdkVersion = 15
-    targetSdkVersion = 29
-    compileSdkVersion = 29
+    targetSdkVersion = 30
+    compileSdkVersion = 30
     buildToolsVersion = '30.0.2'
     ndkVersion = '21.3.6528147'
-    sourceCompatibilityVersion = JavaVersion.VERSION_1_7
-    targetCompatibilityVersion = JavaVersion.VERSION_1_7
 }
 
 ext.deps = [
@@ -72,7 +70,6 @@ ext.deps = [
         fbjni              : 'com.facebook.fbjni:fbjni:0.2.2',
         screenshot         : 'com.facebook.testing.screenshot:core:0.14.0',
         boltsTasks         : 'com.parse.bolts:bolts-tasks:1.4.0',
-        boltsApplinks      : 'com.parse.bolts:bolts-applinks:1.4.0',
         // Annotations
         jsr305             : 'com.google.code.findbugs:jsr305:3.0.2',
         inferAnnotations   : 'com.facebook.infer.annotation:infer-annotation:0.18.0',

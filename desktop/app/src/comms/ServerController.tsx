@@ -10,40 +10,49 @@
 import {
   SecureServerConfig,
   CertificateExchangeMedium,
-} from './utils/CertificateProvider';
-import {Logger} from './fb-interfaces/Logger';
-import {ClientQuery} from './Client';
-import {Store, State} from './reducers/index';
-import CertificateProvider from './utils/CertificateProvider';
+} from '../utils/CertificateProvider';
+import {Logger} from '../fb-interfaces/Logger';
+import {ClientQuery} from '../Client';
+import {Store, State} from '../reducers/index';
+import CertificateProvider from '../utils/CertificateProvider';
 import {RSocketServer} from 'rsocket-core';
 import RSocketTCPServer from 'rsocket-tcp-server';
-import Client from './Client';
-import {FlipperClientConnection} from './Client';
-import {UninitializedClient} from './UninitializedClient';
-import {reportPlatformFailures} from './utils/metrics';
+import Client from '../Client';
+import {
+  ClientConnection,
+  ConnectionStatus,
+  ConnectionStatusChange,
+  ResponseType,
+} from './ClientConnection';
+import {UninitializedClient} from '../UninitializedClient';
+import {reportPlatformFailures} from '../utils/metrics';
 import {EventEmitter} from 'events';
 import invariant from 'invariant';
 import tls from 'tls';
 import net, {Socket} from 'net';
 import {Responder, Payload, ReactiveSocket} from 'rsocket-types';
-import constants from './fb-stubs/constants';
-import GK from './fb-stubs/GK';
-import {initJsEmulatorIPC} from './utils/js-client-server-utils/serverUtils';
-import {buildClientId} from './utils/clientUtils';
+import constants from '../fb-stubs/constants';
+import GK from '../fb-stubs/GK';
+import {initJsEmulatorIPC} from '../utils/js-client-server-utils/serverUtils';
+import {buildClientId} from '../utils/clientUtils';
 import {Single} from 'rsocket-flowable';
 import WebSocket from 'ws';
-import JSDevice from './devices/JSDevice';
-import {WebsocketClientFlipperConnection} from './utils/js-client-server-utils/websocketClientFlipperConnection';
+import JSDevice from '../devices/JSDevice';
+import {BrowserClientFlipperConnection} from './BrowserClientFlipperConnection';
 import querystring from 'querystring';
 import {IncomingMessage} from 'http';
 import ws from 'ws';
-import DummyDevice from './devices/DummyDevice';
-import BaseDevice from './devices/BaseDevice';
-import {sideEffect} from './utils/sideEffect';
-import {destroyDevice} from './reducers/connections';
+import DummyDevice from '../devices/DummyDevice';
+import BaseDevice from '../devices/BaseDevice';
+import {sideEffect} from '../utils/sideEffect';
+import {destroyDevice} from '../reducers/connections';
+import {
+  appNameWithUpdateHint,
+  transformCertificateExchangeMediumToType,
+} from './Utilities';
 
 type ClientInfo = {
-  connection: FlipperClientConnection<any, any> | null | undefined;
+  connection: ClientConnection | null | undefined;
   client: Client;
 };
 
@@ -52,36 +61,13 @@ type ClientCsrQuery = {
   csr_path?: string | undefined;
 };
 
-function transformCertificateExchangeMediumToType(
-  medium: number | undefined,
-): CertificateExchangeMedium {
-  if (medium == 1) {
-    return 'FS_ACCESS';
-  } else if (medium == 2) {
-    return 'WWW';
-  } else {
-    return 'FS_ACCESS';
-  }
-}
-
-declare interface Server {
+declare interface ServerController {
   on(event: 'new-client', callback: (client: Client) => void): this;
   on(event: 'error', callback: (err: Error) => void): this;
   on(event: 'clients-change', callback: () => void): this;
 }
 
-function appNameWithUpdateHint(query: ClientQuery): string {
-  // in previous version (before 3), app may not appear in correct device
-  // section because it refers to the name given by client which is not fixed
-  // for android emulators, so it is indicated as outdated so that developers
-  // might want to update SDK to get rid of this connection swap problem
-  if (query.os === 'Android' && (!query.sdk_version || query.sdk_version < 3)) {
-    return query.app + ' (Outdated SDK)';
-  }
-  return query.app;
-}
-
-class Server extends EventEmitter {
+class ServerController extends EventEmitter {
   connections: Map<string, ClientInfo>;
   secureServer: Promise<RSocketServer<any, any>> | null;
   insecureServer: Promise<RSocketServer<any, any>> | null;
@@ -212,7 +198,7 @@ class Server extends EventEmitter {
             const plugins = message.plugins;
             let resolvedClient: Client | null = null;
             const client = this.addConnection(
-              new WebsocketClientFlipperConnection(ws, app, plugins),
+              new BrowserClientFlipperConnection(ws, app, plugins),
               {
                 app,
                 os: 'JSWebApp',
@@ -234,7 +220,7 @@ class Server extends EventEmitter {
                 if (resolvedClient) {
                   resolvedClient.onMessage(message);
                 } else {
-                  client.then((c) => c.onMessage(message));
+                  client.then((c) => c.onMessage(message)).catch((_) => {});
                 }
               }
             });
@@ -242,10 +228,12 @@ class Server extends EventEmitter {
           }
           case 'disconnect': {
             const app = message.app;
-            (clients[app] || Promise.resolve()).then((c) => {
-              this.removeConnection(c.id);
-              delete clients[app];
-            });
+            (clients[app] || Promise.resolve())
+              .then((c) => {
+                this.removeConnection(c.id);
+                delete clients[app];
+              })
+              .catch((_) => {});
             break;
           }
         }
@@ -297,8 +285,58 @@ class Server extends EventEmitter {
       });
     }
 
+    const clientConnection: ClientConnection = {
+      subscribeToEvents(subscriber: ConnectionStatusChange): void {
+        socket.connectionStatus().subscribe({
+          onNext(payload) {
+            let status = ConnectionStatus.CONNECTED;
+
+            if (payload.kind == 'ERROR') status = ConnectionStatus.ERROR;
+            else if (payload.kind == 'CLOSED') status = ConnectionStatus.CLOSED;
+            else if (payload.kind == 'CONNECTED')
+              status = ConnectionStatus.CONNECTED;
+            else if (payload.kind == 'NOT_CONNECTED')
+              status = ConnectionStatus.NOT_CONNECTED;
+            else if (payload.kind == 'CONNECTING')
+              status = ConnectionStatus.CONNECTING;
+
+            subscriber(status);
+          },
+          onSubscribe(subscription) {
+            subscription.request(Number.MAX_SAFE_INTEGER);
+          },
+          onError(payload) {
+            console.error('[client] connection status error ', payload);
+          },
+        });
+      },
+      close(): void {
+        socket.close();
+      },
+      send(data: any): void {
+        socket.fireAndForget({data: JSON.stringify(data)});
+      },
+      sendExpectResponse(data: any): Promise<any> {
+        return new Promise<any>((resolve, reject) => {
+          socket
+            .requestResponse({
+              data: JSON.stringify(data),
+            })
+            .subscribe({
+              onComplete: (payload: Payload<any, any>) => {
+                const response: ResponseType = JSON.parse(payload.data);
+                response.length = payload.data.length;
+                resolve(response);
+              },
+              onError: (e) => {
+                reject(e);
+              },
+            });
+        });
+      },
+    };
     const client: Promise<Client> = this.addConnection(
-      socket,
+      clientConnection,
       {
         app,
         os,
@@ -316,10 +354,16 @@ class Server extends EventEmitter {
     socket.connectionStatus().subscribe({
       onNext(payload) {
         if (payload.kind == 'ERROR' || payload.kind == 'CLOSED') {
-          client.then((client) => {
-            console.log(`Device disconnected ${client.id}`, 'server', payload);
-            server.removeConnection(client.id);
-          });
+          client
+            .then((client) => {
+              console.log(
+                `Device disconnected ${client.id}`,
+                'server',
+                payload,
+              );
+              server.removeConnection(client.id);
+            })
+            .catch((_) => {});
         }
       },
       onSubscribe(subscription) {
@@ -335,9 +379,11 @@ class Server extends EventEmitter {
         if (resolvedClient) {
           resolvedClient.onMessage(payload.data);
         } else {
-          client.then((client) => {
-            client.onMessage(payload.data);
-          });
+          client
+            .then((client) => {
+              client.onMessage(payload.data);
+            })
+            .catch((_) => {});
         }
       },
     };
@@ -469,7 +515,7 @@ class Server extends EventEmitter {
               transformCertificateExchangeMediumToType(medium),
             )
             .catch((e) => {
-              console.error(e);
+              console.error('Unable to process CSR. Error:', e);
             });
         }
       },
@@ -495,7 +541,7 @@ class Server extends EventEmitter {
   }
 
   async addConnection(
-    conn: FlipperClientConnection<any, any>,
+    conn: ClientConnection,
     query: ClientQuery & {medium: CertificateExchangeMedium},
     csrQuery: ClientCsrQuery,
   ): Promise<Client> {
@@ -548,31 +594,34 @@ class Server extends EventEmitter {
         connection: conn,
       };
 
-      client.init().then(() => {
-        console.debug(
-          `Device client initialised: ${id}. Supported plugins: ${Array.from(
-            client.plugins,
-          ).join(', ')}`,
-          'server',
-        );
+      client
+        .init()
+        .then(() => {
+          console.debug(
+            `Device client initialised: ${id}. Supported plugins: ${Array.from(
+              client.plugins,
+            ).join(', ')}`,
+            'server',
+          );
 
-        /* If a device gets disconnected without being cleaned up properly,
-         * Flipper won't be aware until it attempts to reconnect.
-         * When it does we need to terminate the zombie connection.
-         */
-        if (this.connections.has(id)) {
-          const connectionInfo = this.connections.get(id);
-          connectionInfo &&
-            connectionInfo.connection &&
-            connectionInfo.connection.close();
-          this.removeConnection(id);
-        }
+          /* If a device gets disconnected without being cleaned up properly,
+           * Flipper won't be aware until it attempts to reconnect.
+           * When it does we need to terminate the zombie connection.
+           */
+          if (this.connections.has(id)) {
+            const connectionInfo = this.connections.get(id);
+            connectionInfo &&
+              connectionInfo.connection &&
+              connectionInfo.connection.close();
+            this.removeConnection(id);
+          }
 
-        this.connections.set(id, info);
-        this.emit('new-client', client);
-        this.emit('clients-change');
-        client.emit('plugins-change');
-      });
+          this.connections.set(id, info);
+          this.emit('new-client', client);
+          this.emit('clients-change');
+          client.emit('plugins-change');
+        })
+        .catch((_) => {});
 
       return client;
     });
@@ -650,7 +699,7 @@ async function findDeviceForConnection(
       const timeout = setTimeout(() => {
         unsubscribe();
         const error = `Timed out waiting for device ${serial} for client ${clientId}`;
-        console.error(error);
+        console.error('Unable to find device for connection. Error:', error);
         reject(error);
       }, 15000);
       unsubscribe = sideEffect(
@@ -677,4 +726,4 @@ async function findDeviceForConnection(
   );
 }
 
-export default Server;
+export default ServerController;

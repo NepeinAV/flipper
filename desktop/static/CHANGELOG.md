@@ -1,3 +1,15 @@
+# 0.99.0 (21/7/2021)
+
+ * [D29800712](https://github.com/facebook/flipper/search?q=D29800712&type=Commits) -  Added dark mode support to plugin manager
+ * [D29801181](https://github.com/facebook/flipper/search?q=D29801181&type=Commits) -  Fix dark mode support in changelog dialog.
+
+
+# 0.97.0 (7/7/2021)
+
+ * [D29228868](https://github.com/facebook/flipper/search?q=D29228868&type=Commits) -  [Internal]
+ * [D29585448](https://github.com/facebook/flipper/search?q=D29585448&type=Commits) -  Fixed error handling of UI errors caused by plugins
+
+
 # 0.96.1 (1/7/2021)
 
  * [D29394736](https://github.com/facebook/flipper/search?q=D29394736&type=Commits) -  Flipper that don't use the new Sandy plugin format yet (see https://fbflipper.com/docs/extending/sandy-migration) will now always be loaded inside a legacy container
